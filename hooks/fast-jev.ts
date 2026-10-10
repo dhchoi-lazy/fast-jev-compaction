@@ -191,6 +191,9 @@ export function summarize(result: CompactResult): string {
 
 const UI_LOG_MAX_CHARS = 4096;
 
+/** Delay after a turn ends before the auto-compaction it requested runs. */
+export const AUTO_COMPACT_DELAY_MS = 250;
+
 export function decisionLog(result: CompactResult): string {
   return result.decisions
     .filter((d) => d.reason !== 'pinned')
@@ -289,21 +292,35 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
   });
 
+  // `$.session.compact()` rejects while a turn runs, and the turn is still
+  // running while its own `turn.complete` hooks are dispatched. Let the turn
+  // finish first and compact from a timer once the session is between turns.
+  // A subagent's turn ends while the main turn runs, so only main-loop turns
+  // can request it.
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    const answer = await next(event);
+    if (compacting || event.agentId !== undefined) return answer;
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      compacting = true;
-      await $.session.compact();
+      if ((context.percent ?? 0) < configured.compactAtPercent) return answer;
     } catch (error) {
-      $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
-      );
-    } finally {
-      compacting = false;
+      $.ui.log(`auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
+      return answer;
     }
-    return next(event);
+    compacting = true;
+    $.clock.after(AUTO_COMPACT_DELAY_MS, () => {
+      $.session
+        .compact()
+        .catch((error: unknown) => {
+          $.ui.log(
+            `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
+          );
+        })
+        .finally(() => {
+          compacting = false;
+        });
+    });
+    return answer;
   });
 };
 
